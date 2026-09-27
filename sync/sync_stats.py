@@ -9,8 +9,9 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import nflreadpy as nfl
+import polars as pl
 
-from common import POSITIONS, name_key, record_status, upsert
+from common import DRY_RUN, POSITIONS, name_key, patch, record_status, select, upsert
 
 ET = ZoneInfo("America/New_York")
 
@@ -62,7 +63,13 @@ def main():
 
     # 2. Player game logs (offensive skill positions only)
     stats = nfl.load_player_stats(seasons)
-    stats = stats.filter(stats["position"].is_in(list(POSITIONS))).sort(["season", "week"]).to_dicts()
+    # Offensive players (incl. fullbacks), plus two-way players like a CB who also plays WR:
+    # anyone else with at least 10 targets + carries across the loaded seasons. All of their games are kept.
+    usage = (stats.group_by("player_id")
+             .agg((pl.col("targets").fill_null(0) + pl.col("carries").fill_null(0)).sum().alias("touches")))
+    two_way = usage.filter(pl.col("touches") >= 10)["player_id"].to_list()
+    stats = stats.filter(pl.col("position").is_in(list(POSITIONS)) | pl.col("player_id").is_in(two_way))
+    stats = stats.sort(["season", "week"]).to_dicts()
 
     players = {}
     logs = []
@@ -111,6 +118,20 @@ def main():
         detail["injuries"] = len(rows)
     except Exception as e:  # injuries are nice-to-have; don't fail the whole job
         detail["injuries_error"] = str(e)[:200]
+
+    # 4. Link props already on the board to players who were just added (e.g. a fullback).
+    if not DRY_RUN:
+        by_key = {}
+        for p in players.values():
+            by_key.setdefault(p["name_key"], []).append(p["player_id"])
+        linked = 0
+        for row in select("current_lines", {"select": "player_name", "player_id": "is.null"}):
+            ids = by_key.get(name_key(row["player_name"]), [])
+            if len(ids) == 1:
+                patch("current_lines", {"player_name": f"eq.{row['player_name']}", "player_id": "is.null"},
+                      {"player_id": ids[0]})
+                linked += 1
+        detail["props_linked"] = linked
 
     record_status("stats", True, detail)
     print(detail)

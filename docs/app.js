@@ -13,6 +13,25 @@ const MARKETS = {
     val: g => (g.rush_yds == null && g.rec_yds == null) ? null : (Number(g.rush_yds) || 0) + (Number(g.rec_yds) || 0),
   },
 };
+const TEAMS = {
+  ARI: 'Arizona Cardinals', ATL: 'Atlanta Falcons', BAL: 'Baltimore Ravens', BUF: 'Buffalo Bills', CAR: 'Carolina Panthers',
+  CHI: 'Chicago Bears', CIN: 'Cincinnati Bengals', CLE: 'Cleveland Browns', DAL: 'Dallas Cowboys', DEN: 'Denver Broncos',
+  DET: 'Detroit Lions', GB: 'Green Bay Packers', HOU: 'Houston Texans', IND: 'Indianapolis Colts', JAX: 'Jacksonville Jaguars',
+  KC: 'Kansas City Chiefs', LV: 'Las Vegas Raiders', LAC: 'Los Angeles Chargers', LA: 'Los Angeles Rams', MIA: 'Miami Dolphins',
+  MIN: 'Minnesota Vikings', NE: 'New England Patriots', NO: 'New Orleans Saints', NYG: 'New York Giants', NYJ: 'New York Jets',
+  PHI: 'Philadelphia Eagles', PIT: 'Pittsburgh Steelers', SF: 'San Francisco 49ers', SEA: 'Seattle Seahawks',
+  TB: 'Tampa Bay Buccaneers', TEN: 'Tennessee Titans', WAS: 'Washington Commanders',
+};
+// Stat choices for a player with no line today, by position.
+const POS_MARKETS = {
+  QB: ['player_pass_yds', 'player_rush_yds'],
+  RB: ['player_rush_yds', 'player_rush_reception_yds', 'player_reception_yds', 'player_receptions'],
+  FB: ['player_rush_yds', 'player_reception_yds', 'player_receptions'],
+  WR: ['player_reception_yds', 'player_receptions'],
+  TE: ['player_reception_yds', 'player_receptions'],
+};
+// Defense-vs-position groups only cover QB/RB/WR/TE.
+const posGroup = p => p === 'FB' ? 'RB' : ['QB', 'RB', 'WR', 'TE'].includes(p) ? p : 'WR';
 // Must match the schedule in .github/workflows/sync-lines.yml (UTC).
 const PULLS = [{ dow: 4, h: 17 }, { dow: 0, h: 12 }, { dow: 1, h: 17 }];
 const C = { more: '#4BF08F', less: '#FF7A66', warn: '#F5C451', muted: '#9AA3AF' };
@@ -58,6 +77,10 @@ const S = {
   stat: 'all',
   sort: store.get('sort', 'edge'),
   picks: store.get('picks', {}),   // key -> { side, name, market, line, book, pid }
+  query: '',                         // search box text
+  filter: null,                      // { type: 'team' | 'game', value, label }
+  remote: { q: '', rows: [] },       // player search results from the database
+  custom: {},                        // "pid|market" -> custom line on the player page
   data: null,
 };
 const save = () => { store.set('book', S.book); store.set('n', S.n); store.set('minHit', S.minHit); store.set('sort', S.sort); store.set('picks', S.picks); };
@@ -114,7 +137,7 @@ function analyze(line, n) {
   const p = d.players[line.player_id];
   const logs = (d.logsBy[line.player_id] || []).filter(g => m.val(g) != null);
   const values = logs.map(g => Number(m.val(g)));
-  const L = Number(line.line);
+  const L = Number(line.custom ?? line.line);
   const proj = projection(values);
   const edge = proj == null ? null : proj - L;
   const more = edge == null ? true : edge >= 0;
@@ -126,7 +149,7 @@ function analyze(line, n) {
   const sd = recent.length > 1 ? Math.sqrt(recent.reduce((x, y) => x + (y - mean) ** 2, 0) / (recent.length - 1)) : 0;
   // Rank by how many standard deviations the projection sits from the line, trusting small samples less.
   const score = edge == null ? -1 : Math.abs(edge) / Math.max(sd, 0.5) * Math.min(1, recent.length / 8);
-  const g = d.games[line.game_id];
+  const g = d.games[line.game_id] || line.game;
   const team = p?.team;
   let opp = '', oppTeam = null;
   if (g && team) {
@@ -136,7 +159,7 @@ function analyze(line, n) {
   return {
     key: `${line.event_id}|${line.book}|${line.market}|${line.player_name}`,
     line, m, p, logs, values, L, proj, edge, more, win, hits, pct, team, opp, oppTeam, game: g, score, small: values.length < 5,
-    kickoff: new Date(line.kickoff),
+    kickoff: line.kickoff ? new Date(line.kickoff) : null,
   };
 }
 
@@ -186,7 +209,7 @@ function cardHtml(a) {
   const pctColor = a.pct == null || a.small ? C.muted : a.pct >= 70 ? (a.more ? C.more : C.less) : a.pct >= 55 ? C.warn : C.muted;
   const side = a.more ? 'More' : 'Less';
   const href = a.line.player_id ? `#/p/${encodeURIComponent(a.line.player_id)}/${a.line.market}` : null;
-  const who = `<b>${esc(name)}${href ? ' <i>›</i>' : ''}</b><small>${esc([a.p?.position, a.team && `${a.team} ${a.opp}`, kickFmt.format(a.kickoff)].filter(Boolean).join(' · '))}</small>`;
+  const who = `<b>${esc(name)}${href ? ' <i>›</i>' : ''}</b><small>${esc([a.p?.position, a.team && `${a.team} ${a.opp}`, a.kickoff && kickFmt.format(a.kickoff)].filter(Boolean).join(' · '))}</small>`;
   return `
   <article class="card">
     <div class="card-top">
@@ -207,6 +230,62 @@ function cardHtml(a) {
   </article>`;
 }
 
+// ---------- search ----------
+const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.'-]/g, '');
+function teamWords(abbr) { return abbr ? `${abbr} ${TEAMS[abbr] || ''}` : ''; }
+function matchesQuery(a, qn) {
+  if (!qn) return true;
+  const hay = norm([a.p?.name || a.line.player_name, teamWords(a.team), teamWords(a.oppTeam),
+    a.game && `${a.game.away_team} @ ${a.game.home_team}`].join(' '));
+  return qn.split(/\s+/).every(t => hay.includes(t));
+}
+function matchesFilter(a) {
+  const f = S.filter;
+  if (!f) return true;
+  if (f.type === 'team') return a.team === f.value;
+  return (a.game?.game_id || a.line.event_id) === f.value;
+}
+let searchTimer = null;
+function searchRemote(text) {
+  clearTimeout(searchTimer);
+  const term = norm(text).replace(/[^a-z0-9 ]/g, '').trim();
+  if (term.length < 2) { S.remote = { q: '', rows: [] }; return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const rows = await q('players', { select: 'player_id,name,position,team,last_season', name: `ilike.*${term.replace(/ /g, '*')}*`, order: 'last_season.desc,name.asc' });
+      S.remote = { q: term, rows: rows.slice(0, 8) };
+      if (S.query && norm(S.query).includes(term)) rerenderSearch();
+    } catch (e) { console.warn('search failed', e); }
+  }, 250);
+}
+function suggestionsHtml() {
+  const qn = norm(S.query).trim();
+  if (!qn) return '';
+  const onBoard = new Set(S.data.lines.map(l => l.player_id));
+  const players = new Map();
+  Object.values(S.data.players).forEach(p => { if (norm(p.name).includes(qn)) players.set(p.player_id, p); });
+  S.remote.rows.forEach(p => { if (norm(p.name).includes(qn.split(' ')[0])) players.set(p.player_id, p); });
+  const pl = [...players.values()].sort((x, y) => onBoard.has(y.player_id) - onBoard.has(x.player_id)).slice(0, 6);
+  const teams = Object.entries(TEAMS).filter(([k, v]) => norm(k) === qn || norm(v).includes(qn)).slice(0, 4);
+  const seen = new Set();
+  const games = Object.values(S.data.games).filter(g => {
+    const hay = norm(`${teamWords(g.away_team)} ${teamWords(g.home_team)} ${g.away_team} @ ${g.home_team}`);
+    return qn.split(/\s+/).every(t => hay.includes(t)) && !seen.has(g.game_id) && seen.add(g.game_id);
+  }).slice(0, 4);
+  if (!pl.length && !teams.length && !games.length) return `<div class="sugg"><p class="sugg-none">No players, teams or games match "${esc(S.query)}".</p></div>`;
+  const pRows = pl.map(p => `<a class="sugg-row" href="#/p/${encodeURIComponent(p.player_id)}"><span><b>${esc(p.name)}</b><small>${esc([p.position, p.team].filter(Boolean).join(' · '))}</small></span><em>${onBoard.has(p.player_id) ? 'On board' : 'No line today'}</em></a>`).join('');
+  const tRows = teams.map(([k, v]) => `<button class="sugg-row" data-filter-team="${k}"><span><b>${esc(v)}</b><small>${k} · show their props</small></span><em>Team</em></button>`).join('');
+  const gRows = games.map(g => `<button class="sugg-row" data-filter-game="${esc(g.game_id)}" data-label="${esc(`${g.away_team} @ ${g.home_team}`)}"><span><b>${esc(`${g.away_team} @ ${g.home_team}`)}</b><small>${esc(g.kickoff ? kickFmt.format(new Date(g.kickoff)) : '')}</small></span><em>Game</em></button>`).join('');
+  return `<div class="sugg">${pl.length ? `<h3>Players</h3>${pRows}` : ''}${teams.length ? `<h3>Teams</h3>${tRows}` : ''}${games.length ? `<h3>Games</h3>${gRows}` : ''}</div>`;
+}
+function rerenderSearch() {
+  const box = document.getElementById('search');
+  const pos = box ? box.selectionStart : null;
+  rerender();
+  const again = document.getElementById('search');
+  if (again && pos != null) { again.focus(); again.setSelectionRange(pos, pos); }
+}
+
 function boardHtml() {
   const d = S.data;
   const books = [...new Set(d.lines.map(l => l.book))];
@@ -218,16 +297,21 @@ function boardHtml() {
   const sortBtns = [['edge', 'Edge'], ['game', 'Game'], ['team', 'Team']].map(([k, v]) =>
     `<button data-sort="${k}" aria-pressed="${S.sort === k}">${v}</button>`).join('');
 
+  // While searching or filtering to a team/game, show every matching prop regardless of hit rate.
+  const searching = !!(S.query.trim() || S.filter);
   let props = d.lines.filter(l => l.book === S.book && MARKETS[l.market] && (S.stat === 'all' || l.market === S.stat))
     .map(l => analyze(l, S.n))
-    .filter(a => a.pct == null ? S.minHit === 0 : a.pct >= S.minHit)
+    .filter(a => matchesFilter(a) && matchesQuery(a, searching ? norm(S.query).trim() : ''))
+    .filter(a => searching || (a.pct == null ? S.minHit === 0 : a.pct >= S.minHit))
     .sort((x, y) => y.score - x.score);
 
   let list;
   if (!d.lines.length) {
     list = `<div class="empty"><strong>No lines on the board yet</strong>Lines are pulled Thursday, Sunday morning and Monday before kickoffs. Check back after the next pull.</div>`;
   } else if (!props.length) {
-    list = `<div class="empty">No props clear this hit rate. Lower the slider or widen the sample.</div>`;
+    list = searching
+      ? `<div class="empty">No props on the board for this search${S.filter ? ` (${esc(S.filter.label)})` : ''}.</div>`
+      : `<div class="empty">No props clear this hit rate. Lower the slider or widen the sample.</div>`;
   } else if (S.sort === 'edge') {
     list = props.map(cardHtml).join('');
   } else {
@@ -251,7 +335,17 @@ function boardHtml() {
     }).join('');
   }
 
+  const searchNote = searching ? '<p class="search-note">Showing every hit rate while searching.</p>' : '';
+  const chip = S.filter ? `<div class="filter-chip"><span>${esc(S.filter.label)}</span><button data-clear-filter aria-label="Clear ${esc(S.filter.label)} filter">✕</button></div>` : '';
   return `${header()}
+  <div class="search">
+    <label for="search" class="sr-only">Search players, teams or games</label>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    <input id="search" type="search" placeholder="Search players, teams, games" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search" value="${esc(S.query)}">
+    ${S.query ? '<button class="search-x" data-clear-search aria-label="Clear search">✕</button>' : ''}
+  </div>
+  ${suggestionsHtml()}
+  ${chip}
   <div class="sites">${bookBtns}</div>
   <div class="panel">
     <div class="row"><span class="label">Sample</span><div class="seg">${winBtns}</div></div>
@@ -263,21 +357,48 @@ function boardHtml() {
   <div class="chips scroll-x">${statBtns}</div>
   <div class="listbar"><span>${props.length} ${props.length === 1 ? 'prop' : 'props'} · ${BOOKS[S.book] || ''}</span>
     <div class="sort" role="group" aria-label="Sort props"><span>SORT</span>${sortBtns}</div></div>
+  ${searchNote}
   <div class="list">${list}</div>
   <p class="note">Hit rates describe past games, not future results. Projections are a simple recency-weighted average.</p>`;
 }
 
 function playerHtml(pid, market) {
   const d = S.data;
-  const mine = d.lines.filter(l => l.player_id === pid && MARKETS[l.market]);
   const p = d.players[pid];
-  if (!mine.length || !p) return `<div class="empty"><strong>No current line</strong>This player isn't on the board right now. <a href="#/">Back to the board</a></div>`;
-  const inBook = mine.filter(l => l.book === S.book);
-  const pool = inBook.length ? inBook : mine;
-  const markets = [...new Set(pool.map(l => l.market))];
-  if (!markets.includes(market)) market = markets[0];
-  const line = pool.find(l => l.market === market);
-  const a = analyze(line, S.n);
+  if (!p) return `<div class="empty"><strong>Player not found</strong><a href="#/">Back to the board</a></div>`;
+  const mine = d.lines.filter(l => l.player_id === pid && MARKETS[l.market]);
+  const siteLine = mine.length > 0;
+  let markets, line;
+  if (siteLine) {
+    const inBook = mine.filter(l => l.book === S.book);
+    const pool = inBook.length ? inBook : mine;
+    markets = [...new Set(pool.map(l => l.market))];
+    if (!markets.includes(market)) market = markets[0];
+    line = pool.find(l => l.market === market);
+  } else {
+    // No line today: start from a line near the player's recent average, which you can adjust.
+    const logs = d.logsBy[pid] || [];
+    const all = POS_MARKETS[p.position] || POS_MARKETS.WR;
+    markets = all.filter(k => logs.some(g => Number(MARKETS[k].val(g)) > 0));
+    if (!markets.length) markets = all;
+    if (!markets.includes(market)) market = markets[0];
+    const vals = logs.map(g => MARKETS[market].val(g)).filter(v => v != null).slice(0, 10).map(Number);
+    const avg = vals.length ? vals.reduce((x, y) => x + y, 0) / vals.length : 0;
+    const start = Math.floor(avg) + 0.5;
+    const ng = d.nextGame?.[p.team];
+    line = { market, line: start, first_line: start, player_id: pid, player_name: p.name, event_id: null, book: null,
+      game: ng, game_id: ng?.game_id, kickoff: ng?.kickoff };
+  }
+  const ckey = `${pid}|${market}`;
+  const baseLine = Number(line.line);
+  const isCustom = S.custom[ckey] != null && S.custom[ckey] !== baseLine;
+  const a = analyze({ ...line, custom: S.custom[ckey] }, S.n);
+  const step = market === 'player_receptions' ? 1 : market === 'player_pass_yds' ? 10 : 5;
+  const stepper = `<div class="stepper" role="group" aria-label="Adjust line">
+      <button data-step="-${step}" data-base="${a.L}" data-ckey="${esc(ckey)}" aria-label="Lower line by ${step}">−</button>
+      <button data-step="${step}" data-base="${a.L}" data-ckey="${esc(ckey)}" aria-label="Raise line by ${step}">+</button>
+      ${isCustom ? `<button class="reset" data-step="reset" data-ckey="${esc(ckey)}">${siteLine ? 'Site line' : 'Reset'}</button>` : ''}
+    </div>`;
   const n = S.n;
   const side = a.more ? 'More' : 'Less';
   const pick = S.picks[a.key]?.side;
@@ -314,10 +435,10 @@ function playerHtml(pid, market) {
   const usage = p.position === 'QB'
     ? { label: 'Pass attempts (L3)', value: fmt1(l3.reduce((s, g) => s + (g.pass_att || 0), 0) / (l3.length || 1)) }
     : { label: 'Target share (L3)', value: l3.length ? Math.round(l3.reduce((s, g) => s + (Number(g.target_share) || 0), 0) / l3.length * 100) + '%' : '–' };
-  const dv = a.oppTeam ? d.def[`${a.oppTeam}|${p.position}`] : null;
+  const dv = a.oppTeam ? d.def[`${a.oppTeam}|${posGroup(p.position)}`] : null;
   const rank = dv ? dv[`${a.m.rank}_rank`] : null;
   const matchup = dv ? {
-    label: `${a.oppTeam} vs ${p.position}s`,
+    label: `${a.oppTeam} vs ${posGroup(p.position)}s`,
     value: ordinal(rank),
     sub: `${rank >= 22 ? 'Soft' : rank <= 10 ? 'Tough' : 'Average'} · allows ${fmt1(dv[a.m.rank])}/gm (${dv.games} gms)`,
   } : { label: 'Matchup', value: '–', sub: 'Not enough games yet' };
@@ -331,25 +452,27 @@ function playerHtml(pid, market) {
   const mkBtns = markets.map(k => `<button data-market="${k}" aria-pressed="${k === market}">${MARKETS[k].label}</button>`).join('');
   const winBtns = [5, 10, 20].map(x => `<button data-n="${x}" aria-pressed="${n === x}">L${x}</button>`).join('');
   const initials = (p.name || '').split(' ').map(s => s[0]).slice(0, 2).join('');
-  const ran = new Date(line.fetched_at);
+  const ran = line.fetched_at ? new Date(line.fetched_at) : null;
+  const topNote = siteLine ? `${BOOKS[line.book] || line.book} · lines as of ${timeFmt.format(ran)}` : 'No line today · set your own below';
 
   return `
   <header class="p-top">
     <a class="iconbtn" href="#/" aria-label="Back to board"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></a>
-    <span>${esc(BOOKS[line.book] || line.book)} · lines as of ${esc(timeFmt.format(ran))}</span>
+    <span>${esc(topNote)}</span>
     <span style="width:44px"></span>
   </header>
   <div class="p-body">
     <div class="p-id">
       ${p.headshot_url ? `<img src="${esc(p.headshot_url)}" alt="" onerror="this.style.visibility='hidden'">` : `<div class="ph">${esc(initials)}</div>`}
-      <div><h1>${esc(p.name)}</h1><small>${esc([p.position, `${a.team} ${a.opp}`, kickFmt.format(a.kickoff)].join(' · '))}</small></div>
+      <div><h1>${esc(p.name)}</h1><small>${esc([p.position, a.team && `${a.team} ${a.opp}`.trim(), a.kickoff && kickFmt.format(a.kickoff)].filter(Boolean).join(' · '))}</small></div>
     </div>
     <div class="chips p-chips scroll-x">${mkBtns}</div>
     <section class="box">
       <div class="row" style="align-items:flex-start">
-        <div class="bigline"><small class="label">${esc(a.m.long)}</small><b>${fmt1(a.L)}</b></div>
+        <div class="bigline"><small class="label">${esc(a.m.long)}${isCustom || !siteLine ? ' · your line' : ''}</small><b>${fmt1(a.L)}</b></div>
         <div class="seg">${winBtns}</div>
       </div>
+      ${stepper}
       <div class="tiles3">
         <div><small>${side} rate</small><b style="color:${a.more ? C.more : C.less}">${a.win.length ? `${a.hits}/${a.win.length}` : '–'}</b></div>
         <div><small>Average</small><b>${fmt1(avg)}</b></div>
@@ -368,15 +491,17 @@ function playerHtml(pid, market) {
       <div><small>${esc(usage.label)}</small><b>${esc(usage.value)}</b></div>
       <div><small>Games in sample</small><b>${a.logs.length}</b><small>last 2 seasons</small></div>
       <div><small>${esc(matchup.label)}</small><b>${esc(matchup.value)}</b><small>${esc(matchup.sub || '')}</small></div>
-      <div><small>Line move</small><b>${fmt1(first)} → ${fmt1(line.line)}</b><small style="color:${moved ? C.warn : C.muted}">${moved ? `Moved ${moved > 0 ? 'up' : 'down'} since first seen` : 'Unchanged since first seen'}</small></div>
+      ${siteLine
+        ? `<div><small>Line move</small><b>${fmt1(first)} → ${fmt1(line.line)}</b><small style="color:${moved ? C.warn : C.muted}">${moved ? `Moved ${moved > 0 ? 'up' : 'down'} since first seen` : 'Unchanged since first seen'}</small></div>`
+        : `<div><small>Site line</small><b>None today</b><small>Not posted yet, or no game</small></div>`}
     </section>
     <div class="status"><i class="dot" style="background:${injColor}"></i><span>${esc(injText)}</span></div>
     <p class="note" style="margin:0">Hit rates describe past games, not future results. Set limits and play responsibly.</p>
   </div>
-  <div class="cta">
+  ${siteLine && !isCustom ? `<div class="cta">
     <button class="less" data-pick="less" data-key="${esc(a.key)}" aria-pressed="${pick === 'less'}">▼ Less ${fmt1(a.L)}</button>
     <button class="more" data-pick="more" data-key="${esc(a.key)}" aria-pressed="${pick === 'more'}">▲ More ${fmt1(a.L)}</button>
-  </div>`;
+  </div>` : ''}`;
 }
 
 function slipHtml() {
@@ -409,6 +534,29 @@ function aboutHtml() {
 }
 
 // ---------- routing & events ----------
+// Load history for a player who isn't on today's board (opened from search).
+const loadingPlayers = new Set();
+async function ensurePlayer(pid) {
+  const d = S.data;
+  if (d.players[pid] && d.logsBy[pid]) return;
+  const [pl, logs, inj] = await Promise.all([
+    q('players', { select: 'player_id,name,position,team,headshot_url', player_id: `eq.${pid}` }),
+    q('player_games', { select: 'player_id,game_id,season,week,season_type,team,opponent,is_home,pass_att,pass_yds,rush_yds,rec,rec_yds,target_share', player_id: `eq.${pid}`, order: 'season.desc,week.desc' }),
+    q('injuries', { select: 'player_id,season,week,report_status,injury,practice_status', player_id: `eq.${pid}`, order: 'season.desc,week.desc' }),
+  ]);
+  if (!pl.length) return;
+  d.players[pid] = pl[0];
+  d.logsBy[pid] = logs;
+  if (inj[0]) d.injBy[pid] = inj[0];
+  const team = pl[0].team;
+  d.nextGame ||= {};
+  if (team && !(team in d.nextGame)) {
+    const g = await q('games', { select: 'game_id,season,week,kickoff,home_team,away_team', or: `(home_team.eq.${team},away_team.eq.${team})`,
+      kickoff: `gte.${new Date(Date.now() - 5 * 3600e3).toISOString()}`, order: 'kickoff.asc' });
+    d.nextGame[team] = g[0] || null;
+  }
+}
+
 function route() {
   const h = location.hash.replace(/^#/, '') || '/';
   const parts = h.split('/').filter(Boolean);
@@ -418,11 +566,28 @@ function route() {
   const count = Object.keys(S.picks).length;
   badge.hidden = !count; badge.textContent = count;
   if (!S.data) return;
-  $view.classList.toggle('has-cta', parts[0] === 'p');
-  if (parts[0] === 'p') $view.innerHTML = playerHtml(decodeURIComponent(parts[1] || ''), parts[2]);
+
+  if (parts[0] === 'p') {
+    const pid = decodeURIComponent(parts[1] || '');
+    const known = S.data.players[pid];
+    if (known === undefined || (known && !S.data.logsBy[pid])) {
+      $view.innerHTML = '<div class="loading">Loading player…</div>';
+      if (!loadingPlayers.has(pid)) {
+        loadingPlayers.add(pid);
+        ensurePlayer(pid).catch(e => console.warn(e)).finally(() => {
+          loadingPlayers.delete(pid);
+          if (!S.data.players[pid]) S.data.players[pid] = null;
+          if (location.hash.includes(encodeURIComponent(pid))) route();
+        });
+      }
+      return;
+    }
+    $view.innerHTML = playerHtml(pid, parts[2]);
+  }
   else if (parts[0] === 'slip') $view.innerHTML = slipHtml();
   else if (parts[0] === 'about') $view.innerHTML = aboutHtml();
   else $view.innerHTML = boardHtml();
+  $view.classList.toggle('has-cta', !!$view.querySelector('.cta'));
 }
 
 function rerender(keepScroll = true) {
@@ -438,6 +603,15 @@ $view.addEventListener('click', e => {
   else if (b.dataset.n) { S.n = Number(b.dataset.n); }
   else if (b.dataset.stat) { S.stat = b.dataset.stat; }
   else if (b.dataset.sort) { S.sort = b.dataset.sort; }
+  else if (b.dataset.filterTeam) { S.filter = { type: 'team', value: b.dataset.filterTeam, label: TEAMS[b.dataset.filterTeam] || b.dataset.filterTeam }; S.query = ''; }
+  else if (b.dataset.filterGame) { S.filter = { type: 'game', value: b.dataset.filterGame, label: b.dataset.label }; S.query = ''; }
+  else if ('clearFilter' in b.dataset) { S.filter = null; }
+  else if ('clearSearch' in b.dataset) { S.query = ''; S.remote = { q: '', rows: [] }; save(); rerenderSearch(); return; }
+  else if (b.dataset.step) {
+    const k = b.dataset.ckey;
+    if (b.dataset.step === 'reset') delete S.custom[k];
+    else S.custom[k] = Math.max(0.5, Number(b.dataset.base) + Number(b.dataset.step));
+  }
   else if (b.dataset.market) {
     const parts = location.hash.split('/');
     location.hash = `#/p/${parts[2]}/${b.dataset.market}`;
@@ -456,6 +630,12 @@ $view.addEventListener('click', e => {
   rerender();
 });
 $view.addEventListener('input', e => {
+  if (e.target.id === 'search') {
+    S.query = e.target.value;
+    searchRemote(S.query);
+    rerenderSearch();
+    return;
+  }
   if (e.target.id === 'minhit') {
     S.minHit = Number(e.target.value);
     save();

@@ -10,7 +10,7 @@ import requests
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-POSITIONS = ("QB", "RB", "WR", "TE")
+POSITIONS = ("QB", "RB", "FB", "WR", "TE")
 
 # The Odds API uses full team names; nflverse uses these abbreviations.
 TEAM_ABBR = {
@@ -108,6 +108,15 @@ def delete(table: str, params: dict):
     r = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=_headers(), timeout=60)
     if r.status_code >= 300:
         raise RuntimeError(f"delete {table} failed: {r.status_code} {r.text[:500]}")
+
+
+def patch(table: str, params: dict, values: dict):
+    if DRY_RUN:
+        return print(f"[dry run] patch {table} {params} -> {values}")
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}", params=params,
+                       headers=_headers({"Prefer": "return=minimal"}), data=json.dumps(values), timeout=60)
+    if r.status_code >= 300:
+        raise RuntimeError(f"patch {table} failed: {r.status_code} {r.text[:500]}")
 
 
 def record_status(job: str, ok: bool, detail: dict):
