@@ -1,0 +1,10 @@
+{
+  "name": "PropLens",
+  "short_name": "PropLens",
+  "description": "NFL player prop trends for PrizePicks, Underdog and Pick6",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0B0D10",
+  "theme_color": "#0B0D10",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

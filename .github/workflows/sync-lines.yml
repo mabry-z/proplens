@@ -1,0 +1,33 @@
+name: Sync prop lines
+
+# Free plan budget (500 credits/month): each game costs ~5 credits (one per prop type).
+# Thursday + Sunday + Monday runs use roughly 350-400 credits a month.
+on:
+  schedule:
+    - cron: "0 17 * * 4"   # Thu 17:00 UTC - Thursday night game
+    - cron: "0 12 * * 0"   # Sun 12:00 UTC (8am ET) - whole Sunday slate + Monday night
+    - cron: "0 17 * * 1"   # Mon 17:00 UTC - refresh Monday night lines
+  workflow_dispatch:
+    inputs:
+      hours_ahead:
+        description: "Fetch games kicking off within this many hours"
+        default: "36"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Pull PrizePicks, Underdog and Pick6 lines
+        working-directory: sync
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          HOURS_AHEAD: ${{ inputs.hours_ahead || '36' }}
+        run: python sync_lines.py
