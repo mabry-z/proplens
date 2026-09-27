@@ -18,6 +18,12 @@ NFL player-prop trends for PrizePicks, Underdog and DraftKings Pick6: a phone we
 
 The app will be at `https://mabry-z.github.io/proplens/`. On iPhone, open it in Safari → Share → Add to Home Screen.
 
+## Home-screen app
+
+The site installs like an app (Safari → Share → Add to Home Screen, or Chrome → Install app). It has its own icon and startup screen, opens without the browser bar, works offline with the last data it loaded, and refreshes by pulling down from the top.
+
+When you change anything in `docs/`, bump `VERSION` in `docs/sw.js` so installed copies pick up the update.
+
 ## Credit budget
 
 Each game costs about 1 credit per prop type returned (5 types by default); listing games is free. The three scheduled runs use roughly 350–400 of the 500 monthly credits. The job stops early if fewer than 25 credits remain. To pull more often, add a cron line to `.github/workflows/sync-lines.yml` or move to a paid plan. The About tab shows credits left.

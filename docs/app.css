@@ -19,6 +19,30 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--body); -webkit-text-size-adjust: 100%; }
+html { overscroll-behavior-y: none; }
+body { -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+input { -webkit-user-select: text; user-select: text; }
+a, button, input { touch-action: manipulation; }
+button, a.iconbtn, .sugg-row { transition: transform .08s ease, background-color .12s ease, opacity .12s ease; }
+button:active, a.iconbtn:active, .sugg-row:active, .card .who:active { transform: scale(.97); opacity: .85; }
+.view.enter { animation: fadein .18s ease-out; }
+@keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+@keyframes toastin { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@media (prefers-reduced-motion: reduce) { .view.enter { animation: none; } button:active { transform: none; } }
+
+/* Pull to refresh */
+.ptr { position: fixed; left: 50%; top: env(safe-area-inset-top); z-index: 20; width: 40px; height: 40px; margin-top: 8px; border-radius: 50%; background: var(--card-2); border: 1px solid var(--line-2); display: flex; align-items: center; justify-content: center; transform: translate(-50%, -60px); opacity: 0; pointer-events: none; }
+.ptr svg { width: 20px; height: 20px; fill: none; stroke: var(--muted); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.ptr.ready svg { stroke: var(--more); }
+.ptr.spin { opacity: 1; transition: transform .2s ease; }
+.ptr.spin svg { stroke: var(--more); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Toast */
+.toast { position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30; max-width: calc(100% - 40px); padding: 12px 16px; border-radius: 14px; background: var(--text); color: var(--bg); font-size: 14px; font-weight: 700; box-shadow: 0 8px 24px rgba(0,0,0,.4); animation: toastin .18s ease-out; }
+.toast.tappable { cursor: pointer; }
+.toast[hidden] { display: none; }
+.offline { color: var(--warn); }
 button { font: inherit; cursor: pointer; }
 a { color: var(--more); text-decoration: none; }
 .scroll-x { overflow-x: auto; scrollbar-width: none; }

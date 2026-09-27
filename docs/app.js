@@ -55,6 +55,7 @@ async function q(table, params) {
     Object.entries({ ...params, limit: 1000, offset }).forEach(([k, v]) => url.searchParams.set(k, v));
     const r = await fetch(url, { headers: { apikey: SUPABASE_KEY } });
     if (!r.ok) throw new Error(`${table}: ${r.status}`);
+    if (r.headers.get('x-proplens-offline')) S.offline = true;
     const rows = await r.json();
     out.push(...rows);
     if (rows.length < 1000) return out;
@@ -87,6 +88,7 @@ const save = () => { store.set('book', S.book); store.set('n', S.n); store.set('
 
 async function load() {
   const now = Date.now();
+  S.offline = false;
   const [status, lines] = await Promise.all([
     q('sync_status', { select: 'job,ran_at,ok,detail' }),
     q('current_lines', { select: '*', kickoff: `gte.${new Date(now - 5 * 3600e3).toISOString()}`, order: 'kickoff.asc' }),
@@ -113,6 +115,7 @@ async function load() {
   const def = {};
   defense.forEach(d => { def[`${d.defense}|${d.position}`] = d; });
 
+  S.loadedAt = Date.now();
   S.data = {
     status: Object.fromEntries(status.map(s => [s.job, s])),
     lines, players: byId(players), games: byId(games), logsBy, injBy, def,
@@ -173,7 +176,7 @@ function header() {
   <header class="top">
     <div class="brand">
       <svg viewBox="0 0 30 30" fill="none" aria-hidden="true"><rect x="1" y="1" width="28" height="28" rx="9" stroke="#4BF08F" stroke-width="2"/><path d="M8 20l5-6 4 3 5-8" stroke="#4BF08F" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <div><b>PROPLENS</b><small>NFL${week ? ` · Week ${week}` : ''}</small></div>
+      <div><b>PROPLENS</b><small>NFL${week ? ` · Week ${week}` : ''}${S.offline ? ' · <span class="offline">Offline</span>' : ''}</small></div>
     </div>
     <div class="asof">
       <span><i class="dot ${fresh ? 'fresh' : ''}"></i>${ran ? `Lines ${esc(timeFmt.format(ran))}` : 'No lines yet'}</span>
@@ -588,6 +591,7 @@ function route() {
   else if (parts[0] === 'about') $view.innerHTML = aboutHtml();
   else $view.innerHTML = boardHtml();
   $view.classList.toggle('has-cta', !!$view.querySelector('.cta'));
+  document.querySelectorAll('.tabbar a').forEach(a => a.toggleAttribute('aria-current', a.classList.contains('on')));
 }
 
 function rerender(keepScroll = true) {
@@ -643,7 +647,107 @@ $view.addEventListener('input', e => {
     document.getElementById('minhit')?.focus();
   }
 });
-window.addEventListener('hashchange', () => { route(); window.scrollTo(0, 0); });
+// ---------- app-like behaviour ----------
+// Remember scroll position per screen, so going back to the board lands where you left it.
+const scrollMemo = {};
+let lastHash = location.hash || '#/';
+window.addEventListener('scroll', () => { scrollMemo[location.hash || '#/'] = window.scrollY; }, { passive: true });
+window.addEventListener('hashchange', () => {
+  const h = location.hash || '#/';
+  const goingBack = h === '#/' || h === '' || h.startsWith('#/slip') || h.startsWith('#/about');
+  route();
+  $view.classList.remove('enter'); void $view.offsetWidth; $view.classList.add('enter');
+  window.scrollTo(0, goingBack ? (scrollMemo[h] || 0) : 0);
+  lastHash = h;
+});
+
+const $toast = document.getElementById('toast');
+let toastTimer = null;
+function toast(msg, onTap) {
+  $toast.textContent = msg;
+  $toast.hidden = false;
+  $toast.onclick = onTap || null;
+  $toast.classList.toggle('tappable', !!onTap);
+  clearTimeout(toastTimer);
+  if (!onTap) toastTimer = setTimeout(() => { $toast.hidden = true; }, 2200);
+}
+
+let refreshing = false;
+async function refresh(quiet) {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await load();
+    rerender();
+    if (!quiet) toast(S.offline ? 'Offline · showing saved data' : 'Board updated');
+  } catch (e) {
+    if (!quiet) toast('Couldn\'t refresh. Check your connection.');
+  } finally { refreshing = false; }
+}
+
+// Pull down from the top of the page to refresh (there's no browser reload button in the home-screen app).
+const $ptr = document.getElementById('ptr');
+let pull = null;
+window.addEventListener('touchstart', e => {
+  if (window.scrollY > 0 || refreshing || e.touches.length > 1) return;
+  pull = { y: e.touches[0].clientY, x: e.touches[0].clientX, d: 0 };
+}, { passive: true });
+window.addEventListener('touchmove', e => {
+  if (!pull) return;
+  const dy = e.touches[0].clientY - pull.y, dx = Math.abs(e.touches[0].clientX - pull.x);
+  if (dx > dy) { pull = null; $ptr.style.cssText = ''; return; }
+  pull.d = Math.max(0, Math.min(110, dy * 0.5));
+  $ptr.style.transform = `translate(-50%, ${pull.d - 50}px) rotate(${pull.d * 3}deg)`;
+  $ptr.style.opacity = Math.min(1, pull.d / 60);
+  $ptr.classList.toggle('ready', pull.d >= 60);
+}, { passive: true });
+window.addEventListener('touchend', async () => {
+  if (!pull) return;
+  const go = pull.d >= 60;
+  pull = null;
+  if (!go) { $ptr.style.cssText = ''; return; }
+  $ptr.classList.add('spin');
+  $ptr.style.transform = 'translate(-50%, 16px)';
+  await refresh();
+  $ptr.classList.remove('spin', 'ready');
+  $ptr.style.cssText = '';
+});
+
+// Swipe right from the left edge to go back, like a native app.
+let edge = null;
+window.addEventListener('touchstart', e => {
+  const t = e.touches[0];
+  edge = (t.clientX < 24 && location.hash.startsWith('#/p/')) ? { x: t.clientX, y: t.clientY } : null;
+}, { passive: true });
+window.addEventListener('touchend', e => {
+  if (!edge) return;
+  const t = e.changedTouches[0];
+  if (t.clientX - edge.x > 80 && Math.abs(t.clientY - edge.y) < 60) {
+    if (history.length > 1) history.back(); else location.hash = '#/';
+  }
+  edge = null;
+});
+
+// Coming back to the app after a while: quietly pull fresh numbers.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.data && Date.now() - (S.loadedAt || 0) > 5 * 60e3) refresh(true);
+});
+window.addEventListener('online', () => { if (S.offline) refresh(true); });
+
+// Offline support and instant start-up.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    reg.addEventListener('updatefound', () => {
+      const nw = reg.installing;
+      nw?.addEventListener('statechange', () => {
+        if (nw.state === 'activated' && navigator.serviceWorker.controller) {
+          toast('New version ready · tap to update', () => location.reload());
+        }
+      });
+    });
+  }).catch(() => {});
+}
+if (window.matchMedia('(display-mode: standalone)').matches || navigator.standalone) document.documentElement.classList.add('standalone');
 
 load().then(route).catch(err => {
   console.error(err);
